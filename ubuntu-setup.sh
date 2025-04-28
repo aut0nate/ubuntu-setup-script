@@ -4,111 +4,118 @@
 # Description: Configure and harden a fresh Ubuntu server
 
 set -e  # Exit immediately if a command exits with a non-zero status
+set -o pipefail
 
 # Variables
-SSH_PORT=2222
+SSH_PORT=1985
 USERNAME="nathan"
+USER_SHELL="/bin/bash"
 TIMEZONE="Europe/London"
 LOCALE="en_GB.UTF-8"
 
 # Functions
 update_system() {
-    echo "\nUpdating system packages..."
-    sudo apt update && sudo apt upgrade -y
+    echo -e "\n📦 Updating system packages..."
+    apt update && apt upgrade -y
+}
+
+create_user() {
+    echo -e "\n👤 Creating new user: $USERNAME..."
+    if id "$USERNAME" &>/dev/null; then
+        echo "User $USERNAME already exists, skipping creation."
+    else
+        useradd -m -s "$USER_SHELL" -G sudo "$USERNAME"
+        echo "User $USERNAME created and added to sudo group."
+    fi
 }
 
 set_timezone() {
-    echo "\nSetting timezone..."
-    sudo timedatectl set-timezone "$TIMEZONE"
+    echo -e "\n🌍 Setting timezone..."
+    timedatectl set-timezone "$TIMEZONE"
 }
 
 set_locale() {
-    echo "\nSetting locale..."
-    sudo locale-gen "$LOCALE"
-    sudo update-locale LANG="$LOCALE"
+    echo -e "\n🗣️ Setting locale..."
+    locale-gen "$LOCALE"
+    update-locale LANG="$LOCALE"
 }
 
 harden_ssh() {
-    echo "\nHardening SSH configuration..."
-    sudo sed -i.bak \
-        -e "s/^#Port .*/Port $SSH_PORT/" \
-        -e "s/^#PermitRootLogin .*/PermitRootLogin no/" \
-        -e "s/^#PasswordAuthentication .*/PasswordAuthentication no/" \
-        -e "s/^#PubkeyAuthentication .*/PubkeyAuthentication yes/" \
-        /etc/ssh/sshd_config
+    echo -e "\n🔒 Hardening SSH configuration..."
 
-    # Allow only specific user (optional, uncomment if desired)
-    if ! grep -q "^AllowUsers" /etc/ssh/sshd_config; then
-        echo "AllowUsers $USERNAME" | sudo tee -a /etc/ssh/sshd_config
+    # Configure ssh.socket to listen on the new port
+    mkdir -p /etc/systemd/system/ssh.socket.d
+    tee /etc/systemd/system/ssh.socket.d/listen.conf > /dev/null <<EOF
+[Socket]
+ListenStream=
+ListenStream=$SSH_PORT
+EOF
+
+    systemctl daemon-reload
+    systemctl restart ssh.socket
+
+    # Update SSH configuration
+    SSHD_CLOUD_INIT_FILE="/etc/ssh/sshd_config.d/50-cloud-init.conf"
+    if [ -f "$SSHD_CLOUD_INIT_FILE" ]; then
+        sed -i.bak -E \
+            -e "s/^#?PasswordAuthentication.*/PasswordAuthentication no/" \
+            -e "s/^#?PermitRootLogin.*/PermitRootLogin no/" \
+            "$SSHD_CLOUD_INIT_FILE"
     fi
 
-    sudo systemctl restart sshd
+    # Ensure PubkeyAuthentication is enforced
+    sed -i.bak -E \
+        -e "s/^#?PubkeyAuthentication.*/PubkeyAuthentication yes/" \
+        /etc/ssh/sshd_config
+
+    # Restrict SSH access to the new user
+    if ! grep -q "^AllowUsers" /etc/ssh/sshd_config; then
+        echo "AllowUsers $USERNAME" >> /etc/ssh/sshd_config
+    fi
+
+    systemctl restart ssh
+    systemctl enable ssh
+    echo -e "✅ SSH hardened: Root login disabled, password auth disabled, port changed to $SSH_PORT"
 }
 
 configure_firewall() {
-    echo "\nInstalling and configuring UFW..."
-    sudo apt install ufw -y
-    sudo ufw allow "$SSH_PORT"/tcp
-    sudo ufw allow 80/tcp
-    sudo ufw allow 443/tcp
-    sudo ufw --force enable
-    sudo ufw status verbose
+    echo -e "\n🛡️ Installing and configuring UFW..."
+    apt install ufw -y
+    ufw allow "$SSH_PORT"/tcp
+    ufw allow 80/tcp
+    ufw allow 443/tcp
+    ufw --force enable
+    ufw status verbose
 }
 
 install_fail2ban() {
-    echo -e "\n🚓 Installing and configuring Fail2Ban..."
-
+    echo -e "\n🚓 Installing Fail2Ban..."
     apt install fail2ban -y
     systemctl enable --now fail2ban
-
-    # Backup the default config
-    if [ ! -f /etc/fail2ban/jail.local ]; then
-        cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local
-        echo "✔️ Backed up jail.conf to jail.local"
-    fi
-
-    # Create custom jail overrides
-    tee /etc/fail2ban/jail.d/customisation.local > /dev/null <<EOF
-[DEFAULT]
-bantime = 1h
-
-[sshd]
-enabled = true
-port = $SSH_PORT
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = 5
-bantime = 4h
-EOF
-
-    systemctl restart fail2ban
-
-    echo -e "\n✅ Fail2Ban installed and configured."
-    echo -e "🚨 Current Fail2Ban SSHD jail status:"
-    fail2ban-client status sshd || echo "(⚠️ Note: sshd jail may not show until first attempt to login)"
 }
 
 enable_auto_updates() {
-    echo "\nSetting up automatic security updates..."
-    sudo apt install unattended-upgrades -y
-    sudo dpkg-reconfigure --priority=low unattended-upgrades
+    echo -e "\n🔄 Setting up automatic security updates..."
+    apt install unattended-upgrades -y
+    dpkg-reconfigure --priority=low unattended-upgrades
 }
 
 install_tailscale() {
-    echo "\nInstalling Tailscale..."
+    echo -e "\n🌐 Installing Tailscale..."
     curl -fsSL https://tailscale.com/install.sh | sh
 }
 
 install_docker() {
-    echo "\nInstalling Docker and Docker Compose..."
-    sudo apt install -y docker.io docker-compose
+    echo -e "\n🐳 Installing Docker and Docker Compose..."
+    apt install -y docker.io docker-compose
 
-    sudo systemctl enable --now docker
-    sudo usermod -aG docker "$USERNAME"
+    systemctl enable --now docker
+    usermod -aG docker "$USERNAME"
 }
 
-# Execution
+# Main Execution Flow
 update_system
+create_user
 set_timezone
 set_locale
 harden_ssh
@@ -119,5 +126,6 @@ install_tailscale
 install_docker
 
 # Final message
-echo "\n✅ Setup complete. Please log out and back in to apply Docker group permissions."
-echo "\n⚠️ Remember to run 'tailscale up' to connect your server to your Tailscale network."
+echo -e "✅ Setup complete for $USERNAME!"
+echo -e "⚠️ Please log out and back in to apply Docker group permissions."
+echo -e "⚠️ Run 'sudo tailscale up' to connect the server to your Tailscale network."
